@@ -11,6 +11,12 @@ HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 }
 
+def parse_short_date(date_str):
+    match = re.search(r'(\w{2}\.), (\d{1,2}\.\d{2}\.)', date_str)
+    if match:
+        return f"{match.group(1)} {match.group(2)}"
+    return ""
+
 def fetch_wennigsen_events():
     url = "https://www.wennigsen.de/regional/veranstaltungen/sucheplus.html"
     events = []
@@ -21,9 +27,14 @@ def fetch_wennigsen_events():
             matches = re.findall(pattern, response.text)
             for title, date in matches[:10]:
                 title = title.strip()
-                date = date.replace('&nbsp;', ' ').strip()
+                date = date.replace('&nbsp;', ' ').replace(' - ', '-').strip()
                 if title and title != "zuklappen / aufklappen":
-                    events.append({'title': title, 'date': date, 'location': 'Wennigsen'})
+                    short_date = parse_short_date(date)
+                    if short_date and not re.match(r'^\d', title):
+                        display_title = f"{short_date} {title}"
+                    else:
+                        display_title = title
+                    events.append({'title': display_title, 'date': date, 'location': 'Wennigsen'})
     except Exception as e:
         print(f"Error: {e}")
     return events
@@ -40,7 +51,6 @@ def generate_rss_feed():
     desc.text = "Veranstaltungen in Wennigsen"
     lang = ET.SubElement(channel, "language")
     lang.text = "de-de"
-    
     if not events:
         item = ET.SubElement(channel, "item")
         t = ET.SubElement(item, "title")
@@ -52,7 +62,6 @@ def generate_rss_feed():
             t.text = e['title']
             d = ET.SubElement(item, "description")
             d.text = f"{e['date']}\nOrt: {e['location']}"
-    
     xml_str = ET.tostring(rss, encoding="unicode")
     dom = minidom.parseString(xml_str)
     return dom.toprettyxml(indent="  ", encoding="utf-8").decode("utf-8")

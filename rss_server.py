@@ -27,7 +27,7 @@ GERMAN_MONTHS = {
 }
 
 INTERESTING_KW = [
-    "markt", "konzert", "festival", "sport", "fest", "musik", "theater",
+    "markt", "konzert", "festival", "fest", "musik", "theater",
     "wanderung", "flohmarkt", "kino", "volksfest", "stadtfest", "jahrmarkt",
     "lesung", "kabarett", "comedy", "zirkus", "weihnachtsmarkt", "ostermarkt",
     "sommerfest", "herbstfest", "open air", "openair", "live", "party",
@@ -37,6 +37,8 @@ BORING_KW = [
     "ausstellung", "galerie", "vernissage", "kunstausstellung",
     "skulptur", "malerei", "bildende kunst", "fotoausstellung",
     "kunstwerk", "atelier", "grafik", "zeichnung",
+    "sport", "fußball", "handball", "turnier", "wettkampf", "triathlon",
+    "marathon", "lauf", "schwimmen", "tennis", "volleyball",
 ]
 
 
@@ -235,7 +237,6 @@ def scrape_deister() -> list[Event]:
 HANNOVER_PAGES = [
     ("Konzerte",       "https://www.hannover.de/Veranstaltungskalender/Konzerte"),
     ("Festivals",      "https://www.hannover.de/Veranstaltungskalender/Festivals"),
-    ("Sport",          "https://www.hannover.de/Veranstaltungskalender/Sport"),
     ("Märkte",         "https://www.hannover.de/Veranstaltungskalender/Maerkte-Flohmaerkte"),
     ("Theater & Tanz", "https://www.hannover.de/Veranstaltungskalender/Theater-Tanz"),
 ]

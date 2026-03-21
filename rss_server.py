@@ -3,7 +3,7 @@ import requests
 from bs4 import BeautifulSoup
 import re
 from datetime import date, datetime, timedelta
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 import time
@@ -41,6 +41,14 @@ BORING_KW = [
     "marathon", "lauf", "schwimmen", "tennis", "volleyball",
 ]
 
+# Entfernung von Wennigsen (für Sortierung)
+SOURCE_DISTANCE = {
+    "Wennigsen": 0,
+    "Deister": 1,
+    "Hannover": 2,
+    "Visit Hannover": 3,
+}
+
 
 @dataclass
 class Event:
@@ -58,6 +66,13 @@ class Event:
     def __post_init__(self) -> None:
         self.is_weekend = self.date_obj is not None and self.date_obj.weekday() >= 5
         self.score, self.reason = _score(self)
+
+
+@dataclass
+class MuseumInfo:
+    status: str          # "offen" | "geschlossen" | "nicht erreichbar"
+    detail: str          # z.B. "So 14–17 Uhr" oder Fehlermeldung
+    events: list[Event] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -107,17 +122,15 @@ def parse_german_date(text: str) -> date | None:
 
 
 def _score(event: Event) -> tuple[int, str]:
-    """Regelbasiertes KI-Scoring – kein externer API-Aufruf nötig."""
+    """Regelbasiertes Scoring."""
     title_lower = event.title.lower()
 
-    # Kunstausstellungen sofort herausfiltern
     if any(kw in title_lower for kw in BORING_KW):
-        return 1, "Kunstausstellung – nicht empfohlen"
+        return 1, "Nicht empfohlen"
 
     score = 5
     reasons: list[str] = []
 
-    # Lokaler Bonus
     if event.source == "Wennigsen":
         score += 4
         reasons.append("Lokal in Wennigsen")
@@ -125,12 +138,10 @@ def _score(event: Event) -> tuple[int, str]:
         score += 2
         reasons.append("Deister-Region")
 
-    # Wochenend-Bonus
     if event.is_weekend:
         score += 3
         reasons.append("Wochenendveranstaltung")
 
-    # Kategorie-Bonus
     if any(kw in title_lower for kw in INTERESTING_KW):
         score += 2
         reasons.append("Empfohlene Kategorie")
@@ -147,6 +158,13 @@ def _format_date(event: Event) -> str:
     if event.date_obj:
         return _day_label(event.date_obj)
     return event.date_str or "Datum unbekannt"
+
+
+def _sort_key(e: Event):
+    """Primär: Datum (aufsteigend); Sekundär: Entfernung von Wennigsen."""
+    d = e.date_obj or date(9999, 1, 1)
+    dist = SOURCE_DISTANCE.get(e.source, 9)
+    return (d, dist)
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +200,6 @@ def scrape_wennigsen() -> list[Event]:
                 url=event_url, source="Wennigsen",
             ))
 
-        # Fallback: Regex wenn BeautifulSoup nichts findet
         if not events:
             pattern = r'title="[^"]*">\s*([^<]+)</a></span><span class="manager_untertitel"[^>]*>([^<]+)'
             for title, date_raw in re.findall(pattern, r.text)[:15]:
@@ -310,13 +327,168 @@ def scrape_visit_hannover() -> list[Event]:
 
 
 # ---------------------------------------------------------------------------
+# Heimatmuseum Wennigsen
+# ---------------------------------------------------------------------------
+
+MUSEUM_URLS = [
+    "http://heimatmuseum-wennigsen.de/",
+    "http://heimatmuseum-wennigsen.de/aktuell/",
+    "http://heimatmuseum-wennigsen.de/veranstaltungen/",
+    "http://www.heimatmuseum-wennigsen.de/",
+]
+
+# Bekannte Öffnungszeiten als Fallback (Sonntag 14–17 Uhr, typisch für Heimatmuseen)
+MUSEUM_OPENING_HOURS = {
+    6: (14, 17),  # Sonntag: 14–17 Uhr  (0=Mo … 6=So)
+}
+MUSEUM_OPENING_LABEL = "So 14–17 Uhr (lt. Webseite)"
+
+
+def _museum_open_by_schedule(now: datetime) -> bool:
+    """Prüft anhand bekannter Öffnungszeiten ob das Museum jetzt offen ist."""
+    hours = MUSEUM_OPENING_HOURS.get(now.weekday())
+    if not hours:
+        return False
+    open_h, close_h = hours
+    return open_h <= now.hour < close_h
+
+
+def _parse_museum_opening(text: str) -> dict[int, tuple[int, int]]:
+    """
+    Versucht Öffnungszeiten aus Freitext zu parsen.
+    Gibt {weekday: (open_hour, close_hour)} zurück.
+    """
+    day_map = {
+        'montag': 0, 'mo': 0,
+        'dienstag': 1, 'di': 1,
+        'mittwoch': 2, 'mi': 2,
+        'donnerstag': 3, 'do': 3,
+        'freitag': 4, 'fr': 4,
+        'samstag': 5, 'sa': 5,
+        'sonntag': 6, 'so': 6,
+    }
+    result: dict[int, tuple[int, int]] = {}
+    text_l = text.lower()
+    # Pattern: "Sonntag 14 – 17 Uhr" oder "So. 14:00-17:00 Uhr"
+    for m in re.finditer(
+        r'(montag|dienstag|mittwoch|donnerstag|freitag|samstag|sonntag|mo|di|mi|do|fr|sa|so)\.?\s+'
+        r'(\d{1,2})(?::\d{2})?\s*[-–bis]+\s*(\d{1,2})(?::\d{2})?\s*uhr',
+        text_l
+    ):
+        day_str, open_h, close_h = m.group(1), int(m.group(2)), int(m.group(3))
+        wd = day_map.get(day_str)
+        if wd is not None:
+            result[wd] = (open_h, close_h)
+    return result
+
+
+def scrape_heimatmuseum() -> MuseumInfo:
+    """Scrapt Status und Veranstaltungen des Heimatmuseums Wennigsen."""
+    now = datetime.now()
+    html = ""
+    fetch_ok = False
+    fetch_error = ""
+
+    for url in MUSEUM_URLS:
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=10, allow_redirects=True)
+            # 404-Seiten der alten PHP-Seite erkennen
+            if r.status_code == 200 and "FEHLER: Die Seite ist nicht verfügbar" not in r.text:
+                html = r.text
+                fetch_ok = True
+                break
+        except Exception as e:
+            fetch_error = str(e)
+
+    events: list[Event] = []
+    opening_label = MUSEUM_OPENING_LABEL
+
+    if fetch_ok and html:
+        soup = BeautifulSoup(html, 'html.parser')
+        # Öffnungszeiten aus Seite lesen
+        page_text = soup.get_text()
+        parsed_hours = _parse_museum_opening(page_text)
+        if parsed_hours:
+            # Baue lesbare Beschreibung
+            day_names = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+            parts = [f"{day_names[d]} {o}–{c} Uhr" for d, (o, c) in sorted(parsed_hours.items())]
+            opening_label = ", ".join(parts) + " (lt. Webseite)"
+            # Überschreibe Fallback-Zeiten
+            active_hours = parsed_hours
+        else:
+            active_hours = MUSEUM_OPENING_HOURS
+
+        # Events scrapen
+        museum_base = "http://heimatmuseum-wennigsen.de"
+        for tag in soup.find_all(['h2', 'h3', 'h4', 'li', 'p']):
+            text = tag.get_text(strip=True)
+            if not text or len(text) < 8:
+                continue
+            d = parse_german_date(text)
+            if d and d >= date.today():
+                # Titel: nächsten Textteil holen oder Tag selbst nutzen
+                title = text[:120]
+                href = ''
+                a = tag.find('a') or tag.find_next_sibling('a')
+                if a:
+                    href = a.get('href', '')
+                    if a.get_text(strip=True):
+                        title = a.get_text(strip=True)[:120]
+                event_url = f"{museum_base}{href}" if href.startswith('/') else (href or museum_base)
+                events.append(Event(
+                    title=title, date_str=text[:60],
+                    date_obj=d, time_str="",
+                    location="Heimatmuseum Wennigsen",
+                    url=event_url, source="Wennigsen",
+                ))
+    else:
+        active_hours = MUSEUM_OPENING_HOURS
+
+    # Deduplizieren
+    seen: set[str] = set()
+    deduped_events: list[Event] = []
+    for e in events:
+        key = re.sub(r'\s+', ' ', e.title.lower().strip())
+        if key not in seen:
+            seen.add(key)
+            deduped_events.append(e)
+    deduped_events.sort(key=lambda e: e.date_obj or date(9999, 1, 1))
+
+    # Status bestimmen
+    hours = active_hours.get(now.weekday())
+    if hours and hours[0] <= now.hour < hours[1]:
+        is_open = True
+    elif any(e.date_obj == date.today() for e in deduped_events):
+        # Event heute → Museum offen
+        is_open = True
+    else:
+        is_open = False
+
+    if not fetch_ok:
+        err_short = fetch_error[:60] if fetch_error else "Seite nicht erreichbar"
+        return MuseumInfo(
+            status="⚠ nicht erreichbar",
+            detail=f"Webseite nicht erreichbar ({err_short}). Bekannte Zeiten: {MUSEUM_OPENING_LABEL}",
+            events=[],
+        )
+
+    return MuseumInfo(
+        status="offen" if is_open else "geschlossen",
+        detail=opening_label,
+        events=deduped_events,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Aggregation & Cache
 # ---------------------------------------------------------------------------
 
-def get_events() -> list[Event]:
+def get_data() -> tuple[list[Event], MuseumInfo]:
     now = time.time()
     if _cache['data'] is not None and (now - _cache['timestamp']) < CACHE_TTL:
         return _cache['data']  # type: ignore[return-value]
+
+    museum = scrape_heimatmuseum()
 
     all_events: list[Event] = []
     all_events += scrape_wennigsen()
@@ -324,13 +496,17 @@ def get_events() -> list[Event]:
     all_events += scrape_hannover()
     all_events += scrape_visit_hannover()
 
-    # Filtern und sortieren
-    filtered = [e for e in all_events if e.score >= 3]
-    filtered.sort(key=lambda e: (
-        -e.score,
-        -(1 if e.is_weekend else 0),
-        e.date_obj or date(9999, 1, 1),
-    ))
+    # Museum-Events aus Hauptliste heraushalten (werden separat angezeigt)
+    museum_titles = {re.sub(r'\s+', ' ', e.title.lower().strip()) for e in museum.events}
+
+    filtered = [
+        e for e in all_events
+        if e.score >= 3
+        and re.sub(r'\s+', ' ', e.title.lower().strip()) not in museum_titles
+    ]
+
+    # Primär: Datum aufsteigend; Sekundär: Entfernung von Wennigsen
+    filtered.sort(key=_sort_key)
 
     # Duplikate entfernen (gleicher Titel)
     seen: set[str] = set()
@@ -341,56 +517,102 @@ def get_events() -> list[Event]:
             seen.add(key)
             deduped.append(e)
 
-    _cache['data'] = deduped
+    result = (deduped, museum)
+    _cache['data'] = result
     _cache['timestamp'] = now
-    return deduped
+    return result
+
+
+# Kompatibilitätsfunktion für RSS
+def get_events() -> list[Event]:
+    events, _ = get_data()
+    return events
 
 
 # ---------------------------------------------------------------------------
 # HTML-Seite
 # ---------------------------------------------------------------------------
 
-SOURCE_COLORS = {
-    "Wennigsen":      "#2e7d32",
-    "Deister":        "#6a4c93",
-    "Hannover":       "#1565c0",
-    "Visit Hannover": "#0277bd",
-}
+def _event_row(e: Event) -> str:
+    """Kompakte Zeile: Datum  Titel  [Ort]"""
+    date_part = escape(_format_date(e))
+    time_part = f" {escape(e.time_str)}" if e.time_str else ""
+    weekend_mark = " 🎉" if e.is_weekend else ""
+    loc = f" <span style='color:#888;font-size:12px;'>📍{escape(e.location)}</span>" if e.location else ""
+    return (
+        f"<div style='padding:5px 0;border-bottom:1px solid #f0f0f0;'>"
+        f"<span style='color:#555;font-size:13px;min-width:160px;display:inline-block;'>"
+        f"{date_part}{time_part}{weekend_mark}</span> "
+        f"<a href='{escape(e.url)}' style='font-weight:600;color:#1a1a1a;text-decoration:none;' target='_blank'>"
+        f"{escape(e.title)}</a>{loc}"
+        f"</div>"
+    )
 
 
-def _event_card(e: Event) -> str:
-    color = SOURCE_COLORS.get(e.source, "#555")
-    weekend_bg = " background:#fffde7;" if e.is_weekend else ""
-    stars = "★" * min(e.score // 2, 5)
-    time_part = f"  ·  {escape(e.time_str)}" if e.time_str else ""
-    return f"""
-    <div style="border:1px solid #ddd;border-radius:8px;padding:14px 16px;margin:8px 0;{weekend_bg}">
-      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px;">
-        <span style="background:{color};color:#fff;border-radius:4px;padding:2px 8px;font-size:12px;font-weight:600;">{escape(e.source)}</span>
-        <span style="color:#555;font-size:13px;">📅 {escape(_format_date(e))}{time_part}</span>
-        {"<span style='font-size:11px;color:#f9a825;'>" + stars + "</span>" if stars else ""}
-      </div>
-      <a href="{escape(e.url)}" style="font-size:16px;font-weight:700;color:#1a1a1a;text-decoration:none;" target="_blank">{escape(e.title)}</a>
-      {"<div style='margin-top:4px;font-size:13px;color:#555;'>📍 " + escape(e.location) + "</div>" if e.location else ""}
-      {"<div style='margin-top:4px;font-size:12px;color:#999;font-style:italic;'>" + escape(e.reason) + "</div>" if e.reason else ""}
-    </div>"""
-
-
-def _section(heading: str, icon: str, items: list[Event]) -> str:
+def _source_section(label: str, items: list[Event]) -> str:
     if not items:
         return ""
-    cards = "\n".join(_event_card(e) for e in items)
-    return f"""
-  <h2 style="margin-top:28px;color:#333;border-bottom:2px solid #eee;padding-bottom:6px;">{icon} {heading}</h2>
-  {cards}"""
+    rows = "\n".join(_event_row(e) for e in items)
+    return (
+        f"<div style='margin-top:20px;'>"
+        f"<div style='font-weight:700;font-size:15px;color:#444;border-bottom:2px solid #ccc;"
+        f"padding-bottom:4px;margin-bottom:6px;letter-spacing:.5px;'>— {label} —</div>"
+        f"{rows}"
+        f"</div>"
+    )
 
 
-def render_html(events: list[Event]) -> str:
-    wennigsen = [e for e in events if e.source == "Wennigsen"]
-    weekend   = [e for e in events if e.is_weekend and e.source != "Wennigsen"]
-    rest      = [e for e in events if not e.is_weekend and e.source != "Wennigsen"]
-    total     = len(events)
-    now_str   = datetime.now().strftime("%d.%m.%Y %H:%M")
+def _museum_block(info: MuseumInfo) -> str:
+    if info.status == "offen":
+        status_color = "#2e7d32"
+        icon = "🟢"
+    elif info.status == "geschlossen":
+        status_color = "#c62828"
+        icon = "🔴"
+    else:
+        status_color = "#e65100"
+        icon = "⚠️"
+
+    events_html = ""
+    if info.events:
+        rows = "\n".join(
+            f"<div style='padding:3px 0;font-size:13px;'>"
+            f"<span style='color:#666;min-width:150px;display:inline-block;'>{escape(_day_label(e.date_obj) if e.date_obj else e.date_str)}</span> "
+            f"<a href='{escape(e.url)}' style='color:#1a1a1a;text-decoration:none;' target='_blank'>{escape(e.title)}</a>"
+            f"</div>"
+            for e in info.events
+        )
+        events_html = (
+            f"<div style='margin-top:8px;padding-top:8px;border-top:1px solid #e0e0e0;'>"
+            f"<div style='font-size:12px;color:#666;margin-bottom:4px;'>Veranstaltungen im Heimatmuseum:</div>"
+            f"{rows}"
+            f"</div>"
+        )
+    elif info.status != "⚠ nicht erreichbar":
+        events_html = "<div style='margin-top:6px;font-size:13px;color:#888;'>Keine Veranstaltungen eingetragen.</div>"
+
+    detail_html = f"<div style='font-size:12px;color:#888;margin-top:2px;'>{escape(info.detail)}</div>"
+
+    return (
+        f"<div style='background:#fff;border:2px solid {status_color};border-radius:8px;"
+        f"padding:12px 16px;margin-bottom:16px;'>"
+        f"<div style='font-size:16px;font-weight:700;color:{status_color};'>"
+        f"{icon} Heimatmuseum Wennigsen "
+        f"<span style='font-weight:400;font-size:14px;'>({escape(info.status)})</span>"
+        f"</div>"
+        f"{detail_html}"
+        f"{events_html}"
+        f"</div>"
+    )
+
+
+def render_html(events: list[Event], museum: MuseumInfo) -> str:
+    wennigsen     = [e for e in events if e.source == "Wennigsen"]
+    deister       = [e for e in events if e.source == "Deister"]
+    hannover      = [e for e in events if e.source == "Hannover"]
+    region        = [e for e in events if e.source == "Visit Hannover"]
+    total         = len(events)
+    now_str       = datetime.now().strftime("%d.%m.%Y %H:%M")
 
     return f"""<!DOCTYPE html>
 <html lang="de">
@@ -417,9 +639,14 @@ def render_html(events: list[Event]) -> str:
       <a href="/refresh" style="color:#fff;">Neu laden</a>
     </p>
   </div>
-  {_section("Wennigsen", "⭐", wennigsen)}
-  {_section("Wochenende", "🎉", weekend)}
-  {_section("Weitere Veranstaltungen", "📍", rest)}
+
+  {_museum_block(museum)}
+
+  {_source_section("Wennigsen", wennigsen)}
+  {_source_section("Deister", deister)}
+  {_source_section("Hannover", hannover)}
+  {_source_section("Region", region)}
+
   {"<p style='text-align:center;color:#aaa;margin-top:40px;'>Keine Veranstaltungen gefunden.</p>" if not events else ""}
 </body>
 </html>"""
@@ -429,14 +656,27 @@ def render_html(events: list[Event]) -> str:
 # RSS-Feed
 # ---------------------------------------------------------------------------
 
-def generate_rss(events: list[Event]) -> str:
+def generate_rss(events: list[Event], museum: MuseumInfo) -> str:
     rss = ET.Element("rss", version="2.0")
     ch = ET.SubElement(rss, "channel")
     ET.SubElement(ch, "title").text = "Veranstaltungen – Wennigsen & Region"
     ET.SubElement(ch, "link").text = "https://www.wennigsen.de"
-    ET.SubElement(ch, "description").text = "Events aus Wennigsen, Deister und Hannover – smart gefiltert"
+    ET.SubElement(ch, "description").text = "Events aus Wennigsen, Deister und Hannover"
     ET.SubElement(ch, "language").text = "de-de"
     ET.SubElement(ch, "lastBuildDate").text = datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S +0000")
+
+    # Museum-Status als erstes Item
+    museum_item = ET.SubElement(ch, "item")
+    ET.SubElement(museum_item, "title").text = f"Heimatmuseum Wennigsen ({museum.status})"
+    ET.SubElement(museum_item, "link").text = "http://heimatmuseum-wennigsen.de"
+    museum_desc = museum.detail
+    if museum.events:
+        museum_desc += "\n\nVeranstaltungen:\n" + "\n".join(
+            f"- {_day_label(e.date_obj) if e.date_obj else e.date_str}: {e.title}"
+            for e in museum.events
+        )
+    ET.SubElement(museum_item, "description").text = museum_desc
+    ET.SubElement(museum_item, "category").text = "Heimatmuseum"
 
     if not events:
         item = ET.SubElement(ch, "item")
@@ -445,8 +685,7 @@ def generate_rss(events: list[Event]) -> str:
     else:
         for e in events:
             item = ET.SubElement(ch, "item")
-            score_prefix = f"[{e.score}/10] " if e.score >= 7 else ""
-            ET.SubElement(item, "title").text = f"{score_prefix}{e.title}"
+            ET.SubElement(item, "title").text = e.title
             ET.SubElement(item, "link").text = e.url
             ET.SubElement(item, "category").text = e.source
 
@@ -472,13 +711,15 @@ def generate_rss(events: list[Event]) -> str:
 
 @app.route("/")
 def index():
-    return Response(render_html(get_events()), mimetype="text/html")
+    events, museum = get_data()
+    return Response(render_html(events, museum), mimetype="text/html")
 
 
 @app.route("/feed")
 @app.route("/feed.rss")
 def rss_feed():
-    return Response(generate_rss(get_events()), mimetype="application/rss+xml")
+    events, museum = get_data()
+    return Response(generate_rss(events, museum), mimetype="application/rss+xml")
 
 
 @app.route("/refresh")
